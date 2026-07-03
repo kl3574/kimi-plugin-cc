@@ -1,20 +1,21 @@
 ---
 name: claude-setup
-description: Verify that Claude Code CLI is installed and authenticated before running Claude reviews from Kimi Code
+description: Check that the Claude Code CLI is installed and authenticated
 ---
 
 # Claude Setup
 
-Run the setup check and report the result to the user.
+Use this skill when the user wants to verify Claude Code CLI readiness.
 
-```bash
-node /home/lkx/.kimi-code/plugins/managed/kimi-plugin-cc/scripts/claude-review.mjs setup
-```
+## Steps
 
-If it fails, guide the user to install Claude Code from https://claude.ai/code and run `claude auth login`.
+1. Run the helper script:
+   ```bash
+   PLUGIN_ROOT="${KIMI_PLUGIN_ROOT:-${KIMI_CODE_HOME:-$HOME/.kimi-code}/plugins/managed/kimi-plugin-cc}"
+   node "$PLUGIN_ROOT/scripts/claude-review.mjs" setup
+   ```
+2. Report the result to the user, including any missing CLI or authentication issues.
 
-Optional: for convenience, create a symlink so other skills can call `claude-review-kimi`:
+## Output
 
-```bash
-ln -sf /home/lkx/.kimi-code/plugins/managed/kimi-plugin-cc/scripts/claude-review.mjs ~/.local/bin/claude-review-kimi
-```
+The setup command prints a status line for each check (e.g., CLI found, authenticated) or a clear error describing what is missing.

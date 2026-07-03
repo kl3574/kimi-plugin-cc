@@ -54,8 +54,37 @@ function getDiff(base, cwd) {
   return [staged, unstaged].filter(Boolean).join('\n');
 }
 
+function splitArgsString(s) {
+  const tokens = [];
+  let i = 0;
+  while (i < s.length) {
+    while (i < s.length && /\s/.test(s[i])) i++;
+    if (i >= s.length) break;
+    let token = '';
+    if (s[i] === '"' || s[i] === "'") {
+      const quote = s[i++];
+      while (i < s.length && s[i] !== quote) token += s[i++];
+      if (i < s.length) i++;
+    } else {
+      while (i < s.length && !/\s/.test(s[i])) token += s[i++];
+    }
+    tokens.push(token);
+  }
+  return tokens;
+}
+
+function normalizeArgv(argv) {
+  let args = argv.slice(2);
+  if (args.length === 1 && args[0].length > 0) {
+    args = splitArgsString(args[0]);
+  } else if (args.length === 1 && args[0].length === 0) {
+    args = [];
+  }
+  return args;
+}
+
 function parseArgs(argv) {
-  const args = argv.slice(2);
+  const args = normalizeArgv(argv);
   const command = args[0];
   const options = { base: null, focus: '', unknown: [], positional: [] };
   for (let i = 1; i < args.length; i++) {

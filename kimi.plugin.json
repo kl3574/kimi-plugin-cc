@@ -2,12 +2,23 @@
   "name": "kimi-plugin-cc",
   "version": "0.1.0",
   "description": "Read-only Claude Code review from inside Kimi Code",
-  "keywords": ["claude", "code-review", "review"],
+  "keywords": [
+    "claude",
+    "code-review",
+    "review"
+  ],
   "skills": "./skills/",
   "commands": "./commands/",
   "interface": {
     "displayName": "Claude Code for Kimi",
     "shortDescription": "Claude Code review inside Kimi Code",
-    "developerName": "kl3574"
-  }
+    "developerName": "kl3574",
+    "longDescription": "Delegate read-only code review to the local Claude Code CLI from inside Kimi Code. Supports normal review, adversarial review, and branch-based review with --base.",
+    "websiteURL": "https://github.com/kl3574/kimi-plugin-cc"
+  },
+  "author": {
+    "name": "kl3574"
+  },
+  "homepage": "https://github.com/kl3574/kimi-plugin-cc",
+  "license": "MIT"
 }

@@ -71,7 +71,7 @@ The plugin ships three skills and three slash commands. Each command is a thin w
 - Requires `claude` on PATH and authenticated.
 - Very large diffs are truncated to 120,000 characters before sending to Claude.
 - Untracked files that have not been staged are not included in the review.
-- Skills and commands reference the helper script relative to the plugin root. If you move the plugin directory, reinstall it so the paths resolve correctly.
+- Skills and commands resolve the helper script via `PLUGIN_ROOT` using `KIMI_PLUGIN_ROOT`, `KIMI_CODE_HOME`, or the default `~/.kimi-code/plugins/managed/kimi-plugin-cc` path.
 - This is a v0.1 local prototype. Compared to the upstream `codex-plugin-cc`, the following are not yet implemented:
   - `--background` / `--wait` flags for non-blocking reviews.
   - `rescue`, `status`, `result`, and `cancel` commands for delegating work and managing background jobs.
