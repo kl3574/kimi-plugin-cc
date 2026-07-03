@@ -41,16 +41,16 @@ Use the skill claude-adversarial-review with base main
 The plugin ships three skills and three slash commands. Each command is a thin wrapper over the corresponding skill. The skills instruct Kimi Code to run `scripts/claude-review.mjs`, which:
 
 1. Verifies the local `claude` CLI is installed and authenticated.
-2. Collects `git diff HEAD` for uncommitted/staged changes, or `git diff <base>...HEAD` when `--base` is given.
+2. Collects `git diff HEAD` for uncommitted/staged changes, or `git diff <base>..HEAD` when `--base` is given.
 3. Builds a reviewer prompt.
-4. Spawns `claude -p --output-format text --bare --permission-mode auto`.
+4. Spawns `claude -p --output-format text --bare --permission-mode plan`.
 5. Returns Claude's findings to the Kimi Code session.
 
 ## Verification
 
 - Plugin manifest: valid JSON, `skills` and `commands` paths present.
 - Helper script: tested with `setup`, `review`, `adversarial-review`, `--base <ref>`, and `--focus <text>`.
-- Claude CLI invoked with `--bare --permission-mode auto --output-format text`.
+- Claude CLI invoked with `--bare --permission-mode plan --output-format text`.
 - Review is read-only; no write tools are passed to Claude.
 - Smoke test in `/tmp/review-test` caught the intentional `add` → `a-b` bug and produced structured Critical findings.
 - Boundary tests passed:

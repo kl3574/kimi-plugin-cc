@@ -60,6 +60,20 @@ function getDiff(base, cwd) {
   return [staged.stdout, unstaged.stdout].filter(Boolean).join('\n');
 }
 
+function sanitizePromptInput(s) {
+  return String(s || '').replace(/[\n\r]/g, ' ').replace(/```/g, "'''").trim();
+}
+
+function validateBaseRef(base) {
+  if (base === undefined || base === null) return;
+  if (base.trim() === '') {
+    throw new Error('--base requires a non-empty ref');
+  }
+  if (base.startsWith('-')) {
+    throw new Error('--base value cannot start with "-"');
+  }
+}
+
 function splitArgsString(s) {
   const tokens = [];
   let i = 0;
@@ -84,8 +98,24 @@ function splitArgsString(s) {
 }
 
 function normalizeArgv(argv) {
-  const raw = argv.slice(2).join(' ');
-  return raw.length > 0 ? splitArgsString(raw) : [];
+  // When invoked from the Kimi Code command wrapper, arguments arrive as a
+  // single quoted string in REVIEW_ARGS (avoids shell interpolation of user
+  // input). The subcommand (review/adversarial-review/setup) is still passed
+  // as argv[2], so we prepend it to any env-var flags.
+  const envArgs = process.env.REVIEW_ARGS;
+  const args = argv.slice(2).filter((a) => a.length > 0);
+  let tokens = [];
+  if (envArgs !== undefined) {
+    tokens = envArgs.length > 0 ? splitArgsString(envArgs) : [];
+  } else if (args.length === 1 && /\s/.test(args[0])) {
+    tokens = splitArgsString(args[0]);
+  } else {
+    tokens = args;
+  }
+  if (args.length > 0 && args[0] !== tokens[0]) {
+    tokens = [args[0], ...tokens];
+  }
+  return tokens;
 }
 
 function parseArgs(argv) {
@@ -156,7 +186,11 @@ function review({ base, focus, adversarial = false, unknown = [], positional = [
     process.exit(1);
   }
 
-  if (adversarial && !focus && positional.length) {
+  if (adversarial && positional.length) {
+    if (focus) {
+      console.error('❌ Cannot use positional focus text together with --focus.');
+      process.exit(1);
+    }
     focus = positional.join(' ');
   } else if (positional.length) {
     console.error(`❌ Unexpected positional argument(s): ${positional.join(' ')}`);
@@ -173,6 +207,17 @@ function review({ base, focus, adversarial = false, unknown = [], positional = [
     console.error('❌ Claude CLI not found on PATH. Run `/kimi-plugin-cc:setup` first.');
     process.exit(1);
   }
+  if (!claudeAuthOk()) {
+    console.error('❌ Claude CLI is not authenticated. Run `/kimi-plugin-cc:setup` first.');
+    process.exit(1);
+  }
+
+  try {
+    validateBaseRef(base);
+  } catch (err) {
+    console.error(`❌ ${err.message}`);
+    process.exit(1);
+  }
 
   let diff;
   try {
@@ -187,6 +232,9 @@ function review({ base, focus, adversarial = false, unknown = [], positional = [
     return;
   }
 
+  const displayBase = sanitizePromptInput(base);
+  const displayFocus = sanitizePromptInput(focus);
+
   const maxDiffChars = 120000;
   let truncated = false;
   const codePoints = [...diff];
@@ -196,13 +244,13 @@ function review({ base, focus, adversarial = false, unknown = [], positional = [
   }
 
   const systemPrompt = adversarial
-    ? `You are a senior staff engineer doing a read-only adversarial code review.${focus ? ` Focus: ${focus}` : ''} Challenge design decisions, trade-offs, hidden assumptions, and failure modes. Be constructive but skeptical. Categorize findings as Critical, Important, or Minor. For each finding include severity, file:line, evidence, why it matters, and a recommended fix. End with an overall verdict.`
+    ? `You are a senior staff engineer doing a read-only adversarial code review.${displayFocus ? ` Focus: ${displayFocus}` : ''} Challenge design decisions, trade-offs, hidden assumptions, and failure modes. Be constructive but skeptical. Categorize findings as Critical, Important, or Minor. For each finding include severity, file:line, evidence, why it matters, and a recommended fix. End with an overall verdict.`
     : `You are a senior staff engineer doing a read-only code review. Categorize findings as Critical, Important, or Minor. For each finding include severity, file:line, evidence, why it matters, and a recommended fix. End with an overall verdict.`;
 
   const userPrompt = [
     'Review the following git diff.',
-    base ? `Base ref: ${base}` : 'Reviewing current uncommitted changes.',
-    focus ? `Focus: ${focus}` : '',
+    base ? `Base ref: ${displayBase}` : 'Reviewing current uncommitted changes.',
+    displayFocus ? `Focus: ${displayFocus}` : '',
     '',
     '```diff',
     diff,
@@ -223,8 +271,18 @@ function review({ base, focus, adversarial = false, unknown = [], positional = [
     maxBuffer: LARGE_BUFFER,
     timeout: 5 * 60 * 1000, // 5 minutes
   });
-  if (result.error && result.error.code === 'ETIMEDOUT') {
-    console.error('❌ Claude review timed out after 5 minutes.');
+  if (result.error) {
+    if (result.error.code === 'ETIMEDOUT') {
+      console.error('❌ Claude review timed out after 5 minutes.');
+    } else {
+      console.error(`❌ Claude review failed to start: ${result.error.message}`);
+    }
+    if (result.stderr) console.error(result.stderr);
+    process.exit(1);
+  }
+  if (result.signal) {
+    console.error(`❌ Claude review was terminated by signal ${result.signal}.`);
+    if (result.stderr) console.error(result.stderr);
     process.exit(1);
   }
   if (result.status !== 0) {
