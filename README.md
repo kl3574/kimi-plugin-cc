@@ -23,9 +23,13 @@ Then restart Kimi Code or run `/reload`.
 
 ```text
 /kimi-plugin-cc:setup
+/kimi-plugin-cc:doctor
+/kimi-plugin-cc:doctor --probe-runtime
 /kimi-plugin-cc:review
 /kimi-plugin-cc:review --base main
 /kimi-plugin-cc:review --base main --focus "security"
+/kimi-plugin-cc:review --path src/utils.js
+/kimi-plugin-cc:review --path src --focus "error handling"
 /kimi-plugin-cc:adversarial-review --base main challenge the error handling
 ```
 
@@ -38,13 +42,24 @@ Use the skill claude-adversarial-review with base main
 
 ## How It Works
 
-The plugin ships three skills and three slash commands. Each command is a thin wrapper over the corresponding skill. The skills instruct Kimi Code to run `scripts/claude-review.mjs`, which:
+The plugin ships four skills and four slash commands. Each command is a thin wrapper over the corresponding skill. The skills instruct Kimi Code to run `scripts/claude-review.mjs`, which:
 
 1. Verifies the local `claude` CLI is installed and authenticated.
-2. Collects `git diff HEAD` for uncommitted/staged changes, or `git diff <base>..HEAD` when `--base` is given.
+2. Collects `git diff` (unstaged) and `git diff --cached` (staged) for working-tree changes, plus untracked files rendered as new-file diffs. Untracked files are included only in the default working-tree review; when `--base` is given, it computes `git merge-base <base> HEAD` and reviews only the committed changes on the current branch since that merge-base (`<merge-base>..HEAD`). When `--path` is given, the diff is restricted to that file or directory.
 3. Builds a reviewer prompt.
 4. Spawns `claude -p --output-format text --bare --permission-mode plan`.
 5. Returns Claude's findings to the Kimi Code session.
+
+## Diagnostics
+
+Run `/kimi-plugin-cc:doctor` to check:
+
+- Plugin-local environment (Node.js version, git repo, writable directories).
+- Whether `claude` is on PATH, its version, and authentication status.
+- Proxy environment variables and proxy socket reachability.
+- Direct connectivity to `api.anthropic.com:443`.
+
+Add `--probe-runtime` to send a minimal prompt to Claude and confirm the API path works end-to-end. If the external CLI fails, the plugin prints the real CLI exit code/signal and stderr and exits without fabricating a review.
 
 ## Verification
 
@@ -57,7 +72,7 @@ The plugin ships three skills and three slash commands. Each command is a thin w
   - Non-git directory → clear error, exit 1.
   - Empty diff → "No changes to review.", exit 0.
   - Invalid base ref → clear English git error, exit 1.
-  - Staged changes in a repo with history → reviewed via `git diff HEAD`.
+  - Staged changes in a repo with history → reviewed via `git diff --cached`.
   - Staged changes in a brand-new repo (no commits yet) → reviewed via `git diff --cached`.
   - Large diff (>1 MB, up to tens of MB) → collected without buffer overflow, truncated to 120 k chars, and reviewed successfully.
   - `--base` / `--focus` without values → clear error, exit 1.
@@ -70,7 +85,7 @@ The plugin ships three skills and three slash commands. Each command is a thin w
 - Requires a local git repository.
 - Requires `claude` on PATH and authenticated.
 - Very large diffs are truncated to 120,000 characters before sending to Claude.
-- Untracked files that have not been staged are not included in the review.
+- Untracked files that have not been staged are included as synthetic new-file diffs, up to 500 KB per file and 1 MB total across all untracked files.
 - Skills and commands resolve the helper script via `PLUGIN_ROOT` using `KIMI_PLUGIN_ROOT`, `KIMI_CODE_HOME`, or the default `~/.kimi-code/plugins/managed/kimi-plugin-cc` path.
 - This is a v0.1 local prototype. Compared to the upstream `codex-plugin-cc`, the following are not yet implemented:
   - `--background` / `--wait` flags for non-blocking reviews.
