@@ -14,7 +14,11 @@ function run(cmd, args, opts = {}) {
 }
 
 function runGit(args, opts = {}) {
-  return run('git', args, { env: { ...process.env, LC_ALL: 'C' }, ...opts });
+  const { env: callerEnv, ...restOpts } = opts;
+  return run('git', args, {
+    env: { ...process.env, LC_ALL: 'C', ...callerEnv },
+    ...restOpts,
+  });
 }
 
 function findGitRoot(cwd = process.cwd()) {
@@ -29,19 +33,25 @@ function hasHead(cwd) {
 }
 
 function getDiff(base, cwd) {
-  const args = ['diff', '--no-color'];
   if (base) {
-    args.push(`${base}...HEAD`);
-  } else if (hasHead(cwd)) {
-    args.push('HEAD');
-  } else {
-    args.push('--cached');
+    const result = runGit(['diff', '--no-color', `${base}...HEAD`], { cwd });
+    if (result.status !== 0) {
+      throw new Error(`git diff failed: ${result.stderr || result.stdout || 'unknown error'}`);
+    }
+    return result.stdout;
   }
-  const result = runGit(args, { cwd });
-  if (result.status !== 0) {
-    throw new Error(`git diff failed: ${result.stderr || result.stdout || 'unknown error'}`);
+  if (!hasHead(cwd)) {
+    const result = runGit(['diff', '--cached', '--no-color'], { cwd });
+    if (result.status !== 0) {
+      throw new Error(`git diff failed: ${result.stderr || result.stdout || 'unknown error'}`);
+    }
+    return result.stdout;
   }
-  return result.stdout;
+  // Combine staged and unstaged diffs separately so that working-tree changes
+  // that cancel out staged changes do not hide the staged patch.
+  const unstaged = runGit(['diff', '--no-color'], { cwd }).stdout;
+  const staged = runGit(['diff', '--cached', '--no-color'], { cwd }).stdout;
+  return [staged, unstaged].filter(Boolean).join('\n');
 }
 
 function parseArgs(argv) {
