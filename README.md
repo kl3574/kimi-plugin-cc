@@ -4,19 +4,20 @@ A Kimi Code plugin that delegates read-only code review to the local Claude Code
 
 ## Install
 
-From a local path:
-
-```text
-/plugins install /home/lkx/kimi-plugin-cc
-/reload
-```
-
-From GitHub:
+From GitHub (recommended):
 
 ```text
 /plugins install https://github.com/kl3574/kimi-plugin-cc
 /reload
 ```
+
+Or clone manually into your Kimi Code plugins directory:
+
+```bash
+git clone https://github.com/kl3574/kimi-plugin-cc.git ~/.kimi-code/plugins/managed/kimi-plugin-cc
+```
+
+Then restart Kimi Code or run `/reload`.
 
 ## Usage
 
@@ -70,7 +71,7 @@ The plugin ships three skills and three slash commands. Each command is a thin w
 - Requires `claude` on PATH and authenticated.
 - Very large diffs are truncated to 120,000 characters before sending to Claude.
 - Untracked files that have not been staged are not included in the review.
-- Skills and commands currently reference the helper script by absolute path `/home/lkx/.kimi-code/plugins/managed/kimi-plugin-cc/scripts/claude-review.mjs`. If you move or copy the plugin elsewhere, reinstall from the new path.
+- Skills and commands reference the helper script relative to the plugin root. If you move the plugin directory, reinstall it so the paths resolve correctly.
 - This is a v0.1 local prototype. Compared to the upstream `codex-plugin-cc`, the following are not yet implemented:
   - `--background` / `--wait` flags for non-blocking reviews.
   - `rescue`, `status`, `result`, and `cancel` commands for delegating work and managing background jobs.
