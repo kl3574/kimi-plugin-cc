@@ -1,31 +1,45 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
 
 const USAGE = `Usage: claude-review.mjs <setup|review|adversarial-review> [--base <ref>] [--focus <text>]`;
+const LARGE_BUFFER = 64 * 1024 * 1024;
 
 function run(cmd, args, opts = {}) {
   return spawnSync(cmd, args, {
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
+    maxBuffer: LARGE_BUFFER,
     ...opts,
   });
 }
 
+function runGit(args, opts = {}) {
+  return run('git', args, { env: { ...process.env, LC_ALL: 'C' }, ...opts });
+}
+
 function findGitRoot(cwd = process.cwd()) {
-  const result = run('git', ['rev-parse', '--show-toplevel'], { cwd });
+  const result = runGit(['rev-parse', '--show-toplevel'], { cwd });
   if (result.status !== 0) return null;
   return result.stdout.trim();
+}
+
+function hasHead(cwd) {
+  const result = runGit(['rev-parse', '--verify', 'HEAD'], { cwd });
+  return result.status === 0;
 }
 
 function getDiff(base, cwd) {
   const args = ['diff', '--no-color'];
   if (base) {
     args.push(`${base}...HEAD`);
+  } else if (hasHead(cwd)) {
+    args.push('HEAD');
+  } else {
+    args.push('--cached');
   }
-  const result = run('git', args, { cwd });
+  const result = runGit(args, { cwd });
   if (result.status !== 0) {
-    throw new Error(`git diff failed: ${result.stderr}`);
+    throw new Error(`git diff failed: ${result.stderr || result.stdout || 'unknown error'}`);
   }
   return result.stdout;
 }
@@ -33,16 +47,30 @@ function getDiff(base, cwd) {
 function parseArgs(argv) {
   const args = argv.slice(2);
   const command = args[0];
-  const options = { base: null, focus: '' };
+  const options = { base: null, focus: '', unknown: [], positional: [] };
   for (let i = 1; i < args.length; i++) {
-    if (args[i] === '--base' && i + 1 < args.length) {
+    if (args[i] === '--base') {
+      if (i + 1 >= args.length || args[i + 1].startsWith('--')) {
+        throw new Error('--base requires a value');
+      }
       options.base = args[++i];
-    } else if (args[i] === '--focus' && i + 1 < args.length) {
+    } else if (args[i] === '--focus') {
+      if (i + 1 >= args.length || args[i + 1].startsWith('--')) {
+        throw new Error('--focus requires a value');
+      }
       options.focus = args[++i];
     } else if (args[i].startsWith('--base=')) {
-      options.base = args[i].slice(7);
+      const value = args[i].slice(7);
+      if (!value) throw new Error('--base requires a value');
+      options.base = value;
     } else if (args[i].startsWith('--focus=')) {
-      options.focus = args[i].slice(8);
+      const value = args[i].slice(8);
+      if (!value) throw new Error('--focus requires a value');
+      options.focus = value;
+    } else if (args[i].startsWith('-')) {
+      options.unknown.push(args[i]);
+    } else {
+      options.positional.push(args[i]);
     }
   }
   return { command, options };
@@ -78,7 +106,19 @@ function setup() {
   console.log('✅ Claude CLI is authenticated.');
 }
 
-function review({ base, focus, adversarial = false }) {
+function review({ base, focus, adversarial = false, unknown = [], positional = [] }) {
+  if (unknown.length) {
+    console.error(`❌ Unknown option(s): ${unknown.join(', ')}`);
+    process.exit(1);
+  }
+
+  if (adversarial && !focus && positional.length) {
+    focus = positional.join(' ');
+  } else if (positional.length) {
+    console.error(`❌ Unexpected positional argument(s): ${positional.join(' ')}`);
+    process.exit(1);
+  }
+
   const gitRoot = findGitRoot();
   if (!gitRoot) {
     console.error('❌ Not inside a git repository.');
@@ -111,7 +151,7 @@ function review({ base, focus, adversarial = false }) {
   }
 
   const systemPrompt = adversarial
-    ? `You are a senior staff engineer doing a read-only adversarial code review. Challenge design decisions, trade-offs, hidden assumptions, and failure modes. Be constructive but skeptical. Categorize findings as Critical, Important, or Minor. For each finding include severity, file:line, evidence, why it matters, and a recommended fix. End with an overall verdict.`
+    ? `You are a senior staff engineer doing a read-only adversarial code review.${focus ? ` Focus: ${focus}` : ''} Challenge design decisions, trade-offs, hidden assumptions, and failure modes. Be constructive but skeptical. Categorize findings as Critical, Important, or Minor. For each finding include severity, file:line, evidence, why it matters, and a recommended fix. End with an overall verdict.`
     : `You are a senior staff engineer doing a read-only code review. Categorize findings as Critical, Important, or Minor. For each finding include severity, file:line, evidence, why it matters, and a recommended fix. End with an overall verdict.`;
 
   const userPrompt = [
@@ -146,7 +186,16 @@ function review({ base, focus, adversarial = false }) {
   console.log(result.stdout);
 }
 
-const { command, options } = parseArgs(process.argv);
+let parsed;
+try {
+  parsed = parseArgs(process.argv);
+} catch (err) {
+  console.error(`❌ ${err.message}`);
+  console.error(USAGE);
+  process.exit(1);
+}
+
+const { command, options } = parsed;
 
 switch (command) {
   case 'setup':
