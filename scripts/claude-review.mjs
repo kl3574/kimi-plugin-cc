@@ -1,25 +1,116 @@
 #!/usr/bin/env node
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const USAGE = `Usage: claude-review.mjs <setup|doctor|review|adversarial-review> [--base <ref>] [--focus <text>] [--path <file-or-dir>] [--probe-runtime]`;
 const LARGE_BUFFER = 64 * 1024 * 1024;
 const REVIEW_TIMEOUT_MS = Number(process.env.CC_REVIEW_TIMEOUT_MS) || 5 * 60 * 1000;
 const PROBE_TIMEOUT_MS = Number(process.env.CC_PROBE_TIMEOUT_MS) || 10 * 1000;
+const KILL_GRACE_MS = 10 * 1000;
 const CONNECT_TIMEOUT_MS = Number(process.env.CC_CONNECT_TIMEOUT_MS) || 5000;
 const MAX_UNTRACKED_BYTES = Number(process.env.CC_MAX_UNTRACKED_BYTES) || 500 * 1024;
 const TOTAL_UNTRACKED_BUDGET_BYTES = Number(process.env.CC_TOTAL_UNTRACKED_BUDGET_BYTES) || 1024 * 1024;
-const NULL_DEVICE = process.platform === 'win32' ? 'NUL' : '/dev/null';
 
 function run(cmd, args, opts = {}) {
+  const { input, ...restOpts } = opts;
   return spawnSync(cmd, args, {
     encoding: 'utf8',
-    stdio: ['pipe', 'pipe', 'pipe'],
+    stdio: input !== undefined ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
     maxBuffer: LARGE_BUFFER,
-    ...opts,
+    input,
+    ...restOpts,
+  });
+}
+
+function runAsync(cmd, args, opts = {}) {
+  const { stdin, timeout = REVIEW_TIMEOUT_MS, maxBuffer = LARGE_BUFFER, ...spawnOpts } = opts;
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, {
+      stdio: stdin !== undefined ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
+      ...spawnOpts,
+    });
+    let stdout = '';
+    let stderr = '';
+    let combinedBytes = 0;
+    let killed = false;
+    let timedOut = false;
+    let killReason = null;
+    let killTimer = null;
+    let resolved = false;
+    const timer = timeout
+      ? setTimeout(() => {
+          if (timedOut || killed) return;
+          timedOut = true;
+          killReason = killReason || 'timeout';
+          child.kill('SIGTERM');
+          if (!killTimer) {
+            killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
+          }
+        }, timeout)
+      : null;
+    child.stdout.on('data', (data) => {
+      if (resolved) return;
+      stdout += data.toString();
+      combinedBytes += data.length;
+      if (combinedBytes > maxBuffer && !killed && !timedOut && !resolved) {
+        killed = true;
+        killReason = killReason || 'maxBuffer';
+        child.kill('SIGTERM');
+        if (!killTimer) {
+          killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
+        }
+      }
+    });
+    child.stderr.on('data', (data) => {
+      if (resolved) return;
+      stderr += data.toString();
+      combinedBytes += data.length;
+      if (combinedBytes > maxBuffer && !killed && !timedOut && !resolved) {
+        killed = true;
+        killReason = killReason || 'maxBuffer';
+        child.kill('SIGTERM');
+        if (!killTimer) {
+          killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
+        }
+      }
+    });
+    child.on('error', (err) => {
+      if (resolved) return;
+      resolved = true;
+      if (timer) clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      resolve({ code: 1, signal: null, stdout, stderr: `❌ Failed to start ${cmd}: ${err.message}` });
+    });
+    child.on('close', (code, signal) => {
+      if (resolved) return;
+      resolved = true;
+      if (timer) clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      if (signal === 'SIGKILL') {
+        const msg = killReason === 'timeout'
+          ? `\n❌ Review timed out after ${timeout / 60000} minutes and was force-killed.`
+          : '\n❌ Review was force-killed after output exceeded the maxBuffer limit.';
+        resolve({ code: 1, signal: 'SIGKILL', stdout, stderr: stderr + msg });
+        return;
+      }
+      if (timedOut) {
+        resolve({ code: 1, signal, stdout, stderr: stderr + `\n❌ Review timed out after ${timeout / 60000} minutes.` });
+        return;
+      }
+      if (signal === 'SIGTERM' && killed) {
+        resolve({ code: 1, signal: 'SIGTERM', stdout, stderr: stderr + '\n❌ Output exceeded maxBuffer limit.' });
+        return;
+      }
+      resolve({ code, signal, stdout, stderr });
+    });
+    if (stdin !== undefined) {
+      child.stdin.write(stdin);
+      child.stdin.end();
+    }
   });
 }
 
@@ -54,19 +145,54 @@ function getUntrackedFiles(cwd) {
   return result.stdout.split('\0').filter(Boolean);
 }
 
-function getUntrackedFileDiff(cwd, file) {
-  const result = runGit(['diff', '--no-index', '--', NULL_DEVICE, file], {
-    cwd,
-    maxBuffer: Math.max(2 * MAX_UNTRACKED_BYTES, 2 * 1024 * 1024),
-  });
-  const out = result.stdout;
-  if (/^Binary files .* differ$/m.test(out)) {
+function isBinaryContent(buf) {
+  if (buf.length === 0) return false;
+  if (buf.includes(0)) return true;
+  const sample = buf.subarray(0, Math.min(buf.length, 8192));
+  let nonPrintable = 0;
+  for (let i = 0; i < sample.length; i += 1) {
+    const b = sample[i];
+    if (b === 0x09 || b === 0x0a || b === 0x0d || (b >= 0x20 && b <= 0x7e)) continue;
+    nonPrintable += 1;
+  }
+  return nonPrintable / sample.length > 0.1;
+}
+
+function gitBlobHash(content) {
+  const header = `blob ${content.length}\0`;
+  return crypto.createHash('sha1').update(header).update(content).digest('hex').slice(0, 7);
+}
+
+function syntheticNewFileDiff(filePath, relPath) {
+  const content = fs.readFileSync(filePath);
+  if (isBinaryContent(content)) {
     return { skipped: true, reason: 'binary file' };
   }
-  if (!out.startsWith('diff --git')) {
-    return { skipped: true, reason: 'git diff failed' };
+  if (content.length === 0) {
+    return { skipped: true, reason: 'empty file' };
   }
-  return { diff: out };
+  const text = content.toString('utf8').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const lines = text.split('\n');
+  const endsWithNewline = text.endsWith('\n');
+  const lineCount = endsWithNewline ? lines.length - 1 : lines.length;
+  const hash = gitBlobHash(content);
+  const header = [
+    `diff --git a/${relPath} b/${relPath}`,
+    'new file mode 100644',
+    `index 0000000..${hash}`,
+    '--- /dev/null',
+    `+++ b/${relPath}`,
+    `@@ -0,0 +1,${lineCount} @@`,
+  ];
+  const body = lines.slice(0, lineCount).map((line) => `+${line}`);
+  if (!endsWithNewline) {
+    body.push('\\ No newline at end of file');
+  }
+  return { diff: header.concat(body).join('\n') };
+}
+
+function getUntrackedFileDiff(cwd, file) {
+  return syntheticNewFileDiff(path.resolve(cwd, file), file);
 }
 
 function formatUntrackedDiff(cwd, target = null) {
@@ -80,7 +206,7 @@ function formatUntrackedDiff(cwd, target = null) {
       files = files.filter((f) => f.startsWith(prefix));
     }
   }
-  if (files.length === 0) return '';
+  if (files.length === 0) return { diff: '', hasRealDiff: false, skipped: [] };
   const parts = [];
   const skipped = [];
   let totalBytes = 0;
@@ -129,10 +255,10 @@ function formatUntrackedDiff(cwd, target = null) {
     totalBytes += diffBytes;
     parts.push(result.diff);
   }
-  if (skipped.length) {
-    parts.push(`\n# Skipped untracked files: ${skipped.join(', ')}`);
-  }
-  return parts.join('\n');
+  const diff = parts.length > 0 && skipped.length > 0
+    ? [...parts, `\n# Skipped untracked files: ${skipped.join(', ')}`].join('\n')
+    : parts.join('\n');
+  return { diff, hasRealDiff: parts.length > 0, skipped };
 }
 
 function getTrackedDiff(base, cwd, target = null) {
@@ -141,6 +267,9 @@ function getTrackedDiff(base, cwd, target = null) {
     const mergeBaseResult = runGit(['merge-base', base, 'HEAD'], { cwd });
     checkGitResult(mergeBaseResult, 'merge-base');
     const mergeBase = mergeBaseResult.stdout.trim();
+    if (!mergeBase) {
+      throw new Error(`git merge-base ${base} HEAD returned empty result; the refs may not share a common ancestor.`);
+    }
     const result = runGit(['diff', '--no-color', `${mergeBase}..HEAD`, ...pathArgs], { cwd });
     checkGitResult(result, 'base');
     return result.stdout;
@@ -162,11 +291,14 @@ function getTrackedDiff(base, cwd, target = null) {
 function buildReviewDiff(base, cwd, target = null) {
   const trackedDiff = getTrackedDiff(base, cwd, target);
   if (base) {
-    return trackedDiff;
+    return { diff: trackedDiff, hasRealDiff: trackedDiff.trim().length > 0, skipped: [] };
   }
-  const untrackedDiff = formatUntrackedDiff(cwd, target);
-  if (!untrackedDiff) return trackedDiff;
-  return [trackedDiff, untrackedDiff].filter(Boolean).join('\n');
+  const untracked = formatUntrackedDiff(cwd, target);
+  return {
+    diff: [trackedDiff, untracked.diff].filter(Boolean).join('\n'),
+    hasRealDiff: trackedDiff.trim().length > 0 || untracked.hasRealDiff,
+    skipped: untracked.skipped,
+  };
 }
 
 function sanitizePromptInput(s) {
@@ -179,8 +311,10 @@ function sanitizePromptInput(s) {
 }
 
 function makeFence(s) {
-  const runs = s.match(/`+/g) || [];
-  const max = Math.max(0, ...runs.map((r) => r.length));
+  let max = 0;
+  for (const m of s.matchAll(/`+/g)) {
+    if (m[0].length > max) max = m[0].length;
+  }
   return '`'.repeat(Math.max(3, max + 1));
 }
 
@@ -206,11 +340,37 @@ function validatePathValue(rawPath) {
   }
 }
 
+function isTrackedPath(cwd, relPath) {
+  const posixRel = relPath.replace(/\\/g, '/');
+  if (runGit(['cat-file', '-e', `HEAD:${posixRel}`], { cwd }).status === 0) return true;
+  const lsResult = runGit(['ls-files', '--error-unmatch', posixRel], { cwd });
+  return lsResult.status === 0;
+}
+
+function trackedObjectType(cwd, relPath) {
+  const posixRel = relPath.replace(/\\/g, '/');
+  const result = runGit(['cat-file', '-t', `HEAD:${posixRel}`], { cwd });
+  if (result.status === 0) return result.stdout.trim();
+  const idxResult = runGit(['ls-files', '--stage', posixRel], { cwd });
+  if (idxResult.status === 0) {
+    const mode = idxResult.stdout.trim().split(/\s+/)[0];
+    if (mode === '160000') return 'submodule';
+    if (mode === '120000') return 'symlink';
+    if (mode === '040000') return 'tree';
+    return 'blob';
+  }
+  return 'blob';
+}
+
 function resolveTargetPath(rawPath) {
   if (!rawPath) return null;
-  const absPath = path.resolve(rawPath);
+
+  const cwdRoot = findGitRoot();
+  const absPath = path.isAbsolute(rawPath) ? path.resolve(rawPath) : path.resolve(rawPath);
+
   let stat;
   let targetType = 'file';
+  let deleted = false;
   try {
     stat = fs.lstatSync(absPath);
     if (stat.isSymbolicLink()) {
@@ -222,26 +382,39 @@ function resolveTargetPath(rawPath) {
     targetType = stat.isDirectory() ? 'dir' : 'file';
   } catch (err) {
     if (err && err.code === 'ENOENT') {
-      const parent = path.dirname(absPath);
-      if (!fs.existsSync(parent)) {
-        throw new Error(`Cannot access --path ${absPath}: ${err.message}`);
+      const searchRoot = path.dirname(absPath);
+      const gitRoot = findGitRoot(searchRoot);
+      if (gitRoot) {
+        const relPath = path.relative(gitRoot, absPath);
+        if (
+          relPath !== '..'
+          && !relPath.startsWith('..' + path.sep)
+          && !path.isAbsolute(relPath)
+          && isTrackedPath(gitRoot, relPath)
+        ) {
+          deleted = true;
+          targetType = trackedObjectType(gitRoot, relPath) === 'tree' ? 'dir' : 'file';
+        } else {
+          throw new Error(`--path does not exist: ${absPath}`);
+        }
+      } else {
+        throw new Error(`--path does not exist: ${absPath}`);
       }
-      targetType = rawPath.endsWith(path.sep) || rawPath.endsWith('/') ? 'dir' : 'file';
     } else {
       throw err;
     }
   }
+
   const searchRoot = stat && stat.isDirectory() ? absPath : path.dirname(absPath);
   const gitRoot = findGitRoot(searchRoot);
   if (!gitRoot) {
     throw new Error(`The path ${absPath} is not inside a git repository.`);
   }
-  const cwdRoot = findGitRoot();
   if (cwdRoot && gitRoot !== cwdRoot) {
     throw new Error(`The path ${absPath} is not inside the current git repository (${cwdRoot}).`);
   }
   const relPath = path.relative(gitRoot, absPath);
-  if (relPath.startsWith('..')) {
+  if (relPath === '..' || relPath.startsWith('..' + path.sep) || path.isAbsolute(relPath)) {
     throw new Error(`The path ${absPath} is outside the git repository (${gitRoot}).`);
   }
   return {
@@ -249,6 +422,7 @@ function resolveTargetPath(rawPath) {
     gitRoot,
     relPath: relPath || '.',
     targetType,
+    deleted,
   };
 }
 
@@ -374,7 +548,7 @@ function pluginRoot() {
 
 function isWritableDir(dir) {
   try {
-    if (!fs.existsSync(dir)) return false;
+    fs.accessSync(dir, fs.constants.F_OK);
     fs.accessSync(dir, fs.constants.W_OK);
     return true;
   } catch {
@@ -405,7 +579,10 @@ function checkProxy() {
     const urlString = /^https?:\/\//i.test(proxy) ? proxy : `http://${proxy}`;
     const u = new URL(urlString);
     host = u.hostname;
-    port = u.port || (u.protocol === 'https:' ? 443 : 80);
+    port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+    if (!Number.isFinite(port) || port < 1 || port > 65535) {
+      return { ok: false, detail: `Proxy URL has invalid port: ${u.port || '(default)'}` };
+    }
   } catch (err) {
     return { ok: false, detail: `Proxy URL parse failed: ${err.message}` };
   }
@@ -416,27 +593,42 @@ function checkProxy() {
   return { ok: false, detail: `Proxy socket unreachable: ${host}:${port}` };
 }
 
-function probeClaude() {
-  const result = run('claude', [
+async function probeClaude() {
+  const result = await runAsync('claude', [
     '-p', 'Reply exactly: RUNTIME-OK',
     '--output-format', 'text',
     '--bare',
     '--permission-mode', 'plan',
-  ], { timeout: PROBE_TIMEOUT_MS });
-  if (result.status !== 0) {
-    return { ok: false, detail: (result.stderr || '').trim() || `exit ${result.status}` };
+  ], { timeout: PROBE_TIMEOUT_MS, maxBuffer: 2 * 1024 * 1024 });
+  if (result.code !== 0) {
+    return { ok: false, detail: (result.stderr || '').trim() || `exit ${result.code}` };
   }
   const first = result.stdout.trim().split('\n')[0];
+  if (first !== 'RUNTIME-OK') {
+    return { ok: false, detail: `unexpected output: "${first}"` };
+  }
   return { ok: true, detail: `returned "${first}"` };
 }
 
-function doctor({ probeRuntime, unknown = [], positional = [] }) {
+async function doctor({ probeRuntime, base, focus, path: pathOption, unknown = [], positional = [] }) {
   if (unknown.length) {
     console.error(`❌ Unknown option(s): ${unknown.join(', ')}`);
     process.exit(1);
   }
   if (positional.length) {
     console.error(`❌ Unexpected positional argument(s): ${positional.join(' ')}`);
+    process.exit(1);
+  }
+  if (base !== undefined && base !== null) {
+    console.error('❌ --base is not valid for the doctor command.');
+    process.exit(1);
+  }
+  if (focus) {
+    console.error('❌ --focus is not valid for the doctor command.');
+    process.exit(1);
+  }
+  if (pathOption) {
+    console.error('❌ --path is not valid for the doctor command.');
     process.exit(1);
   }
   const issues = [];
@@ -459,7 +651,9 @@ function doctor({ probeRuntime, unknown = [], positional = [] }) {
     report(false, 'Current directory is not inside a git repository');
   }
   report(isWritableDir(os.tmpdir()), 'Temp directory is writable', os.tmpdir());
-  report(isWritableDir(pluginRoot()), 'Plugin root is writable', pluginRoot());
+  const root = pluginRoot();
+  const rootWritable = isWritableDir(root);
+  console.log(`${rootWritable ? '[OK]' : '[INFO]'} Plugin root is writable - ${root}${rootWritable ? '' : ' (read-only is OK for managed installs)'}`);
   const kimiHome = process.env.KIMI_CODE_HOME || path.join(os.homedir(), '.kimi-code');
   report(isWritableDir(kimiHome), 'Kimi Code home is writable', kimiHome);
 
@@ -485,7 +679,7 @@ function doctor({ probeRuntime, unknown = [], positional = [] }) {
 
   if (probeRuntime) {
     console.log('\n## Runtime probe');
-    const probe = probeClaude();
+    const probe = await probeClaude();
     report(probe.ok, 'Minimal Claude prompt', probe.detail);
   }
 
@@ -500,9 +694,13 @@ function doctor({ probeRuntime, unknown = [], positional = [] }) {
 
 // -------------------- review --------------------
 
-function review({ base, focus, path: rawPath, adversarial = false, unknown = [], positional = [] }) {
+async function review({ base, focus, path: rawPath, probeRuntime, adversarial = false, unknown = [], positional = [] }) {
   if (unknown.length) {
     console.error(`❌ Unknown option(s): ${unknown.join(', ')}`);
+    process.exit(1);
+  }
+  if (probeRuntime) {
+    console.error('❌ --probe-runtime is only valid for the doctor command.');
     process.exit(1);
   }
 
@@ -555,18 +753,22 @@ function review({ base, focus, path: rawPath, adversarial = false, unknown = [],
     }
   }
 
-  let diff;
+  let diffResult;
   try {
-    diff = buildReviewDiff(base, gitRoot, target);
+    diffResult = buildReviewDiff(base, gitRoot, target);
   } catch (err) {
     console.error(`❌ ${err.message}`);
     process.exit(1);
   }
 
-  if (!diff.trim()) {
+  if (diffResult.skipped.length) {
+    console.warn(`⚠️ Skipped untracked files: ${diffResult.skipped.join(', ')}`);
+  }
+  if (!diffResult.hasRealDiff) {
     console.log('No changes to review.');
     return;
   }
+  let diff = diffResult.diff;
 
   const displayBase = sanitizePromptInput(base);
   const displayFocus = sanitizePromptInput(focus);
@@ -579,35 +781,37 @@ function review({ base, focus, path: rawPath, adversarial = false, unknown = [],
     truncated = true;
   }
 
-  const fence = makeFence(diff);
+  const fence = diff.includes('```') ? makeFence(diff) : '```';
 
   const systemPrompt = adversarial
     ? `You are a senior staff engineer doing a read-only adversarial code review.${displayFocus ? ` Focus: ${displayFocus}` : ''} Challenge design decisions, trade-offs, hidden assumptions, and failure modes. Be constructive but skeptical. Categorize findings as Critical, Important, or Minor. For each finding include severity, file:line, evidence, why it matters, and a recommended fix. End with an overall verdict.`
     : `You are a senior staff engineer doing a read-only code review. Categorize findings as Critical, Important, or Minor. For each finding include severity, file:line, evidence, why it matters, and a recommended fix. End with an overall verdict.`;
 
-  const userPrompt = [
-    'Review the following git diff.',
+  const promptHeader = [
+    'Review the git diff provided on stdin.',
     base ? `Base ref: ${displayBase}` : 'Reviewing current uncommitted changes.',
     displayFocus ? `Focus: ${displayFocus}` : '',
-    '',
+  ].filter(Boolean).join('\n');
+
+  const stdinPayload = [
     `${fence}diff`,
     diff,
     fence,
   ].join('\n');
 
   const claudeArgs = [
-    '-p',
-    userPrompt,
+    '-p', promptHeader,
     '--output-format', 'text',
     '--bare',
     '--permission-mode', 'plan',
     '--system-prompt', systemPrompt,
   ];
 
-  const result = run('claude', claudeArgs, {
+  const result = await runAsync('claude', claudeArgs, {
     cwd: gitRoot,
     maxBuffer: LARGE_BUFFER,
     timeout: REVIEW_TIMEOUT_MS,
+    stdin: stdinPayload,
   });
 
   console.error('## Plugin-local status');
@@ -616,18 +820,6 @@ function review({ base, focus, path: rawPath, adversarial = false, unknown = [],
   console.error(`Diff size: ${Buffer.byteLength(diff, 'utf8')} bytes sent to Claude`);
   console.error();
 
-  if (result.error) {
-    if (result.error.code === 'ETIMEDOUT') {
-      console.error(`❌ Claude review failed (external CLI) - timed out after ${REVIEW_TIMEOUT_MS / 60000} minutes.`);
-    } else {
-      console.error(`❌ Claude review failed (external CLI) - failed to start: ${result.error.message}`);
-    }
-    if (result.stderr) {
-      console.error('## External CLI stderr');
-      console.error(result.stderr);
-    }
-    process.exit(1);
-  }
   if (result.signal) {
     console.error(`❌ Claude review failed (external CLI) - terminated by signal ${result.signal}.`);
     if (result.stderr) {
@@ -636,8 +828,8 @@ function review({ base, focus, path: rawPath, adversarial = false, unknown = [],
     }
     process.exit(1);
   }
-  if (result.status !== 0) {
-    console.error(`❌ Claude review failed (external CLI) - exit code ${result.status}.`);
+  if (result.code !== 0) {
+    console.error(`❌ Claude review failed (external CLI) - exit code ${result.code}.`);
     if (result.stderr) {
       console.error('## External CLI stderr');
       console.error(result.stderr);
@@ -664,20 +856,27 @@ try {
 
 const { command, options } = parsed;
 
-switch (command) {
-  case 'setup':
-    setup();
-    break;
-  case 'doctor':
-    doctor(options);
-    break;
-  case 'review':
-    review(options);
-    break;
-  case 'adversarial-review':
-    review({ ...options, adversarial: true });
-    break;
-  default:
-    console.error(USAGE);
-    process.exit(1);
+async function main() {
+  switch (command) {
+    case 'setup':
+      setup();
+      break;
+    case 'doctor':
+      await doctor(options);
+      break;
+    case 'review':
+      await review(options);
+      break;
+    case 'adversarial-review':
+      await review({ ...options, adversarial: true });
+      break;
+    default:
+      console.error(USAGE);
+      process.exit(1);
+  }
 }
+
+main().catch((err) => {
+  console.error('❌ Unexpected error:', err.message);
+  process.exit(1);
+});
