@@ -32,26 +32,32 @@ function hasHead(cwd) {
   return result.status === 0;
 }
 
+function checkGitDiff(result, label) {
+  if (result.status !== 0) {
+    throw new Error(`git diff (${label}) failed: ${result.stderr || result.stdout || result.error?.message || 'unknown error'}`);
+  }
+}
+
 function getDiff(base, cwd) {
   if (base) {
-    const result = runGit(['diff', '--no-color', `${base}...HEAD`], { cwd });
-    if (result.status !== 0) {
-      throw new Error(`git diff failed: ${result.stderr || result.stdout || 'unknown error'}`);
-    }
+    const result = runGit(['diff', '--no-color', `${base}..HEAD`], { cwd });
+    checkGitDiff(result, 'base');
     return result.stdout;
   }
   if (!hasHead(cwd)) {
-    const result = runGit(['diff', '--cached', '--no-color'], { cwd });
-    if (result.status !== 0) {
-      throw new Error(`git diff failed: ${result.stderr || result.stdout || 'unknown error'}`);
-    }
-    return result.stdout;
+    const staged = runGit(['diff', '--cached', '--no-color'], { cwd });
+    checkGitDiff(staged, 'staged');
+    const unstaged = runGit(['diff', '--no-color'], { cwd });
+    checkGitDiff(unstaged, 'unstaged');
+    return [staged.stdout, unstaged.stdout].filter(Boolean).join('\n');
   }
   // Combine staged and unstaged diffs separately so that working-tree changes
   // that cancel out staged changes do not hide the staged patch.
-  const unstaged = runGit(['diff', '--no-color'], { cwd }).stdout;
-  const staged = runGit(['diff', '--cached', '--no-color'], { cwd }).stdout;
-  return [staged, unstaged].filter(Boolean).join('\n');
+  const unstaged = runGit(['diff', '--no-color'], { cwd });
+  checkGitDiff(unstaged, 'unstaged');
+  const staged = runGit(['diff', '--cached', '--no-color'], { cwd });
+  checkGitDiff(staged, 'staged');
+  return [staged.stdout, unstaged.stdout].filter(Boolean).join('\n');
 }
 
 function splitArgsString(s) {
@@ -63,7 +69,11 @@ function splitArgsString(s) {
     let token = '';
     if (s[i] === '"' || s[i] === "'") {
       const quote = s[i++];
-      while (i < s.length && s[i] !== quote) token += s[i++];
+      while (i < s.length && s[i] !== quote) {
+        if (s[i] === '\\' && i + 1 < s.length) token += s[++i];
+        else token += s[i];
+        i++;
+      }
       if (i < s.length) i++;
     } else {
       while (i < s.length && !/\s/.test(s[i])) token += s[i++];
@@ -74,13 +84,8 @@ function splitArgsString(s) {
 }
 
 function normalizeArgv(argv) {
-  let args = argv.slice(2);
-  if (args.length === 1 && args[0].length > 0) {
-    args = splitArgsString(args[0]);
-  } else if (args.length === 1 && args[0].length === 0) {
-    args = [];
-  }
-  return args;
+  const raw = argv.slice(2).join(' ');
+  return raw.length > 0 ? splitArgsString(raw) : [];
 }
 
 function parseArgs(argv) {
@@ -116,8 +121,8 @@ function parseArgs(argv) {
 }
 
 function claudeOnPath() {
-  const result = run('which', ['claude']);
-  return result.status === 0 && result.stdout.trim().length > 0;
+  const result = run('claude', ['--version']);
+  return result.status === 0;
 }
 
 function claudeVersion() {
@@ -165,7 +170,7 @@ function review({ base, focus, adversarial = false, unknown = [], positional = [
   }
 
   if (!claudeOnPath()) {
-    console.error('❌ Claude CLI not found on PATH. Run `claude-setup` first.');
+    console.error('❌ Claude CLI not found on PATH. Run `/kimi-plugin-cc:setup` first.');
     process.exit(1);
   }
 
@@ -184,8 +189,9 @@ function review({ base, focus, adversarial = false, unknown = [], positional = [
 
   const maxDiffChars = 120000;
   let truncated = false;
-  if (diff.length > maxDiffChars) {
-    diff = diff.slice(0, maxDiffChars) + '\n\n[diff truncated]';
+  const codePoints = [...diff];
+  if (codePoints.length > maxDiffChars) {
+    diff = codePoints.slice(0, maxDiffChars).join('') + '\n\n[diff truncated]';
     truncated = true;
   }
 
@@ -208,17 +214,26 @@ function review({ base, focus, adversarial = false, unknown = [], positional = [
     userPrompt,
     '--output-format', 'text',
     '--bare',
-    '--permission-mode', 'auto',
+    '--permission-mode', 'plan',
     '--system-prompt', systemPrompt,
   ];
 
-  const result = run('claude', claudeArgs, { cwd: gitRoot, maxBuffer: 16 * 1024 * 1024 });
+  const result = run('claude', claudeArgs, {
+    cwd: gitRoot,
+    maxBuffer: LARGE_BUFFER,
+    timeout: 5 * 60 * 1000, // 5 minutes
+  });
+  if (result.error && result.error.code === 'ETIMEDOUT') {
+    console.error('❌ Claude review timed out after 5 minutes.');
+    process.exit(1);
+  }
   if (result.status !== 0) {
     console.error('❌ Claude review failed.');
     if (result.stderr) console.error(result.stderr);
     process.exit(1);
   }
 
+  if (result.stderr) console.error(result.stderr);
   if (truncated) {
     console.log('⚠️ Diff was truncated before sending to Claude.\n');
   }
