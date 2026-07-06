@@ -14,6 +14,7 @@ const KILL_GRACE_MS = 10 * 1000;
 const CONNECT_TIMEOUT_MS = Number(process.env.CC_CONNECT_TIMEOUT_MS) || 5000;
 const MAX_UNTRACKED_BYTES = Number(process.env.CC_MAX_UNTRACKED_BYTES) || 500 * 1024;
 const TOTAL_UNTRACKED_BUDGET_BYTES = Number(process.env.CC_TOTAL_UNTRACKED_BUDGET_BYTES) || 1024 * 1024;
+const CLAUDE_BIN = process.env.CC_CLAUDE_BIN || 'claude';
 
 function run(cmd, args, opts = {}) {
   const { input, ...restOpts } = opts;
@@ -518,18 +519,18 @@ function parseArgs(argv) {
 }
 
 function claudeOnPath() {
-  const result = run('claude', ['--version'], { timeout: PROBE_TIMEOUT_MS });
+  const result = run(CLAUDE_BIN, ['--version'], { timeout: PROBE_TIMEOUT_MS });
   return result.status === 0;
 }
 
 function claudeVersion() {
-  const result = run('claude', ['--version'], { timeout: PROBE_TIMEOUT_MS });
+  const result = run(CLAUDE_BIN, ['--version'], { timeout: PROBE_TIMEOUT_MS });
   if (result.status !== 0) return null;
   return result.stdout.trim();
 }
 
 function claudeAuthOk() {
-  const result = run('claude', ['auth', 'status'], { timeout: PROBE_TIMEOUT_MS });
+  const result = run(CLAUDE_BIN, ['auth', 'status'], { timeout: PROBE_TIMEOUT_MS });
   return result.status === 0;
 }
 
@@ -602,7 +603,7 @@ function checkProxy() {
 }
 
 async function probeClaude() {
-  const result = await runAsync('claude', [
+  const result = await runAsync(CLAUDE_BIN, [
     '-p', 'Reply exactly: RUNTIME-OK',
     '--output-format', 'text',
     '--bare',
@@ -815,7 +816,7 @@ async function review({ base, focus, path: rawPath, probeRuntime, adversarial = 
     '--system-prompt', systemPrompt,
   ];
 
-  const result = await runAsync('claude', claudeArgs, {
+  const result = await runAsync(CLAUDE_BIN, claudeArgs, {
     cwd: gitRoot,
     maxBuffer: LARGE_BUFFER,
     timeout: REVIEW_TIMEOUT_MS,
@@ -886,5 +887,6 @@ async function main() {
 
 main().catch((err) => {
   console.error('❌ Unexpected error:', err.message);
+  if (err.stack) console.error(err.stack);
   process.exit(1);
 });

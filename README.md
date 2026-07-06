@@ -11,13 +11,21 @@ From GitHub (recommended):
 /reload
 ```
 
-Or clone manually into your Kimi Code plugins directory:
+Or clone manually into your Kimi Code plugins directory (replace `~/.kimi-code` with your `$KIMI_CODE_HOME` if you changed it):
 
 ```bash
 git clone https://github.com/kl3574/kimi-plugin-cc.git ~/.kimi-code/plugins/managed/kimi-plugin-cc
 ```
 
 Then restart Kimi Code or run `/reload`.
+
+### Custom Claude CLI location
+
+If your Claude CLI binary is not named `claude` on PATH, set `CC_CLAUDE_BIN`:
+
+```bash
+export CC_CLAUDE_BIN=/path/to/claude
+```
 
 ## Usage
 
