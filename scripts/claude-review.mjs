@@ -6,7 +6,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const USAGE = `Usage: claude-review.mjs <setup|doctor|review|adversarial-review> [--base <ref>] [--focus <text>] [--path <file-or-dir>] [--probe-runtime]`;
+const USAGE = `Usage: claude-review.mjs <setup|doctor|review|adversarial-review|custom-review> [--base <ref>] [--focus <text>] [--path <file-or-dir>] [--probe-runtime]\n       custom-review: --prompt-file <path> | --prompt <text> [--output <path>] [--tools <csv>] [--permission-mode <mode>] [--model <m>] [--cwd <dir>] [--timeout-ms <n>] [--system-prompt <text>]`;
 const LARGE_BUFFER = 64 * 1024 * 1024;
 const REVIEW_TIMEOUT_MS = Number(process.env.CC_REVIEW_TIMEOUT_MS) || 5 * 60 * 1000;
 const PROBE_TIMEOUT_MS = Number(process.env.CC_PROBE_TIMEOUT_MS) || 10 * 1000;
@@ -478,7 +478,7 @@ function normalizeArgv(argv) {
 function parseArgs(argv) {
   const args = normalizeArgv(argv);
   const command = args[0];
-  const options = { base: null, focus: '', path: null, probeRuntime: false, unknown: [], positional: [] };
+  const options = { base: null, focus: '', path: null, probeRuntime: false, prompt: null, promptFile: null, output: null, tools: null, permissionMode: null, model: null, cwd: null, timeoutMs: null, systemPrompt: null, unknown: [], positional: [] };
   for (let i = 1; i < args.length; i++) {
     if (args[i] === '--base') {
       if (i + 1 >= args.length || args[i + 1].startsWith('--')) {
@@ -497,6 +497,51 @@ function parseArgs(argv) {
       options.path = args[++i];
     } else if (args[i] === '--probe-runtime') {
       options.probeRuntime = true;
+    } else if (args[i] === '--prompt') {
+      if (i + 1 >= args.length) throw new Error('--prompt requires a value');
+      options.prompt = args[++i];
+    } else if (args[i] === '--prompt-file') {
+      if (i + 1 >= args.length) throw new Error('--prompt-file requires a value');
+      options.promptFile = args[++i];
+    } else if (args[i] === '--output') {
+      if (i + 1 >= args.length) throw new Error('--output requires a value');
+      options.output = args[++i];
+    } else if (args[i] === '--tools') {
+      if (i + 1 >= args.length) throw new Error('--tools requires a value');
+      options.tools = args[++i];
+    } else if (args[i] === '--permission-mode') {
+      if (i + 1 >= args.length) throw new Error('--permission-mode requires a value');
+      options.permissionMode = args[++i];
+    } else if (args[i] === '--model') {
+      if (i + 1 >= args.length) throw new Error('--model requires a value');
+      options.model = args[++i];
+    } else if (args[i] === '--cwd') {
+      if (i + 1 >= args.length) throw new Error('--cwd requires a value');
+      options.cwd = args[++i];
+    } else if (args[i] === '--timeout-ms') {
+      if (i + 1 >= args.length) throw new Error('--timeout-ms requires a value');
+      options.timeoutMs = args[++i];
+    } else if (args[i] === '--system-prompt') {
+      if (i + 1 >= args.length) throw new Error('--system-prompt requires a value');
+      options.systemPrompt = args[++i];
+    } else if (args[i].startsWith('--prompt-file=')) {
+      options.promptFile = args[i].slice(14);
+    } else if (args[i].startsWith('--prompt=')) {
+      options.prompt = args[i].slice(9);
+    } else if (args[i].startsWith('--output=')) {
+      options.output = args[i].slice(9);
+    } else if (args[i].startsWith('--tools=')) {
+      options.tools = args[i].slice(8);
+    } else if (args[i].startsWith('--permission-mode=')) {
+      options.permissionMode = args[i].slice(18);
+    } else if (args[i].startsWith('--model=')) {
+      options.model = args[i].slice(8);
+    } else if (args[i].startsWith('--cwd=')) {
+      options.cwd = args[i].slice(6);
+    } else if (args[i].startsWith('--timeout-ms=')) {
+      options.timeoutMs = args[i].slice(13);
+    } else if (args[i].startsWith('--system-prompt=')) {
+      options.systemPrompt = args[i].slice(16);
     } else if (args[i].startsWith('--base=')) {
       const value = args[i].slice(7);
       if (!value) throw new Error('--base requires a value');
@@ -854,6 +899,125 @@ async function review({ base, focus, path: rawPath, probeRuntime, adversarial = 
   console.log(result.stdout);
 }
 
+
+// -------------------- custom-review --------------------
+
+const CUSTOM_REVIEW_DEFAULT_TOOLS = 'Read,Grep,Glob,Bash';
+const CUSTOM_REVIEW_DISALLOWED_TOOLS = 'Edit,Write,NotebookEdit';
+
+async function customReview({ prompt, promptFile, output, tools, permissionMode, model, cwd, timeoutMs, systemPrompt, unknown = [], positional = [] }) {
+  if (unknown.length) {
+    console.error(`❌ Unknown option(s): ${unknown.join(', ')}`);
+    process.exit(1);
+  }
+  if (prompt && promptFile) {
+    console.error('❌ Use either --prompt or --prompt-file, not both.');
+    process.exit(1);
+  }
+  let promptText = prompt;
+  if (promptFile) {
+    const absPromptFile = path.resolve(promptFile);
+    try {
+      promptText = fs.readFileSync(absPromptFile, 'utf8');
+    } catch (err) {
+      console.error(`❌ Cannot read --prompt-file: ${absPromptFile} (${err.message})`);
+      process.exit(1);
+    }
+  }
+  if (!promptText && positional.length) {
+    promptText = positional.join(' ');
+  }
+  if (!promptText || !promptText.trim()) {
+    console.error('❌ custom-review requires --prompt-file, --prompt, or positional prompt text.');
+    process.exit(1);
+  }
+
+  // Resolve the working directory and output path up front.  (Lesson from
+  // field use: relative output redirects fail when the caller's shell runs
+  // in a different cwd, e.g. background task wrappers - always absolutize.)
+  const workDir = cwd ? path.resolve(cwd) : process.cwd();
+  if (!fs.existsSync(workDir) || !fs.statSync(workDir).isDirectory()) {
+    console.error(`❌ --cwd is not a directory: ${workDir}`);
+    process.exit(1);
+  }
+  let absOutput = null;
+  if (output) {
+    absOutput = path.isAbsolute(output) ? output : path.resolve(workDir, output);
+    try {
+      fs.mkdirSync(path.dirname(absOutput), { recursive: true });
+    } catch (err) {
+      console.error(`❌ Cannot create output directory for: ${absOutput} (${err.message})`);
+      process.exit(1);
+    }
+  }
+
+  if (!claudeOnPath()) {
+    console.error('❌ Claude CLI not found on PATH. Run `/kimi-plugin-cc:setup` or `/kimi-plugin-cc:doctor` first.');
+    process.exit(1);
+  }
+  if (!claudeAuthOk()) {
+    console.error('❌ Claude CLI is not authenticated. Run `claude auth login` and try again.');
+    process.exit(1);
+  }
+
+  const mode = permissionMode || 'default';
+  if (!['default', 'plan', 'acceptEdits', 'bypassPermissions'].includes(mode)) {
+    console.error(`❌ Invalid --permission-mode "${mode}". Allowed: default, plan, acceptEdits, bypassPermissions.`);
+    process.exit(1);
+  }
+
+  // Prompt goes via stdin: avoids argv length limits and quoting pitfalls.
+  // Model is intentionally NOT passed unless the user asks for it - local
+  // custom model configurations break when an unknown --model is forced.
+  const toolList = tools || CUSTOM_REVIEW_DEFAULT_TOOLS;
+  const claudeArgs = [
+    '-p',
+    '--output-format', 'text',
+    '--permission-mode', mode,
+    '--no-session-persistence',
+    '--allowedTools', toolList,
+    '--disallowedTools', CUSTOM_REVIEW_DISALLOWED_TOOLS,
+  ];
+  if (model) claudeArgs.push('--model', model);
+  if (systemPrompt) claudeArgs.push('--system-prompt', systemPrompt);
+
+  const timeout = Number(timeoutMs) > 0 ? Number(timeoutMs) : REVIEW_TIMEOUT_MS;
+  const result = await runAsync(CLAUDE_BIN, claudeArgs, {
+    cwd: workDir,
+    maxBuffer: LARGE_BUFFER,
+    timeout,
+    stdin: promptText,
+  });
+
+  console.error('## Plugin-local status');
+  console.error(`Working dir: ${workDir}`);
+  console.error(`Permission mode: ${mode}`);
+  console.error(`Allowed tools: ${toolList}`);
+  if (absOutput) console.error(`Output file: ${absOutput}`);
+
+  if (result.signal) {
+    console.error(`❌ Claude custom review failed (external CLI) - terminated by signal ${result.signal}.`);
+    if (result.stderr) console.error('## External CLI stderr\n' + result.stderr);
+    process.exit(1);
+  }
+  if (result.code !== 0) {
+    console.error(`❌ Claude custom review failed (external CLI) - exit code ${result.code}.`);
+    if (result.stderr) console.error('## External CLI stderr\n' + result.stderr);
+    process.exit(1);
+  }
+
+  if (absOutput) {
+    try {
+      fs.writeFileSync(absOutput, result.stdout, 'utf8');
+      console.error(`✅ Review written to ${absOutput} (${Buffer.byteLength(result.stdout, 'utf8')} bytes)`);
+    } catch (err) {
+      console.error(`❌ Cannot write output file: ${absOutput} (${err.message})`);
+      process.exit(1);
+    }
+  }
+  console.log(result.stdout);
+}
+
 let parsed;
 try {
   parsed = parseArgs(process.argv);
@@ -878,6 +1042,9 @@ async function main() {
       break;
     case 'adversarial-review':
       await review({ ...options, adversarial: true });
+      break;
+    case 'custom-review':
+      await customReview(options);
       break;
     default:
       console.error(USAGE);

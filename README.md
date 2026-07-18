@@ -39,6 +39,8 @@ export CC_CLAUDE_BIN=/path/to/claude
 /kimi-plugin-cc:review --path src/utils.js
 /kimi-plugin-cc:review --path src --focus "error handling"
 /kimi-plugin-cc:adversarial-review --base main challenge the error handling
+/kimi-plugin-cc:custom-review --prompt-file /tmp/audit.md --output /tmp/review.md --cwd /path/to/repo
+/kimi-plugin-cc:custom-review --prompt "summarize the risks in src/auth.ts"
 ```
 
 Or use skills directly:
@@ -46,11 +48,29 @@ Or use skills directly:
 ```text
 Use the skill claude-review
 Use the skill claude-adversarial-review with base main
+Use the skill claude-custom-review to audit DESIGN.md against spec.pdf
 ```
+
+## Custom Review (arbitrary content, not just git diffs)
+
+`custom-review` runs a read-only Claude review on anything: a design doc audited
+against a reference paper, results files, or a free-form question with tool
+access to the repo. It was added after field use showed the git-diff commands
+cannot cover document audits. Hardened details:
+
+- Prompt is piped via **stdin** (use `--prompt-file` for long prompts) — no argv
+  length limits or quoting pitfalls.
+- `--output` is always resolved to an **absolute path** and parent directories
+  are created — relative redirects silently fail in background shells.
+- Tool fence: `--allowedTools Read,Grep,Glob,Bash` (configurable via `--tools`),
+  `Edit,Write,NotebookEdit` always disallowed; `--permission-mode default`.
+- `--no-session-persistence` keeps runs stateless and isolated.
+- `--model` is **never forced** — only passed when explicitly given, because
+  custom local model configs break when an unknown model is injected.
 
 ## How It Works
 
-The plugin ships four skills and four slash commands. Each command is a thin wrapper over the corresponding skill. The skills instruct Kimi Code to run `scripts/claude-review.mjs`, which:
+The plugin ships five skills and five slash commands. Each command is a thin wrapper over the corresponding skill. The skills instruct Kimi Code to run `scripts/claude-review.mjs`, which:
 
 1. Verifies the local `claude` CLI is installed and authenticated.
 2. Collects `git diff` (unstaged) and `git diff --cached` (staged) for working-tree changes, plus untracked files rendered as new-file diffs. Untracked files are included only in the default working-tree review; when `--base` is given, it computes `git merge-base <base> HEAD` and reviews only the committed changes on the current branch since that merge-base (`<merge-base>..HEAD`). When `--path` is given, the diff is restricted to that file or directory.
@@ -95,7 +115,8 @@ Add `--probe-runtime` to send a minimal prompt to Claude and confirm the API pat
 - Very large diffs are truncated to 120,000 characters before sending to Claude.
 - Untracked files that have not been staged are included as synthetic new-file diffs, up to 500 KB per file and 1 MB total across all untracked files.
 - Skills and commands resolve the helper script via `PLUGIN_ROOT` using `KIMI_PLUGIN_ROOT`, `KIMI_CODE_HOME`, or the default `~/.kimi-code/plugins/managed/kimi-plugin-cc` path.
-- This is a v0.1 local prototype. Compared to the upstream `codex-plugin-cc`, the following are not yet implemented:
+- `custom-review` requires no git repository; `review`/`adversarial-review` still do.
+- This is a v0.2 local prototype. Compared to the upstream `codex-plugin-cc`, the following are not yet implemented:
   - `--background` / `--wait` flags for non-blocking reviews.
   - `rescue`, `status`, `result`, and `cancel` commands for delegating work and managing background jobs.
   - The stop review gate (`--enable-review-gate` / `--disable-review-gate`).
